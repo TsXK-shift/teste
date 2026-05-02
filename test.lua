@@ -1,7 +1,11 @@
--- STK TRADINGS VALUE CHECKER v3.1
--- Fix: sem testDirectUrl, sem ContentProvider, sem RunService pra imagem
---      detecta Xeno pelo nome e usa download; outros usam URL direta
---      preCacheLocalAssets usa listfiles (rapido)
+-- STK TRADINGS VALUE CHECKER v3.2
+-- Fixes:
+--   [1] DL_TOTAL nao sobe mais ao trocar categoria (DL_QUEUED rastreia URLs ja contadas)
+--   [2] Imagens carregam em TODOS executores com FS (HAS_FS-based, nao IS_XENO)
+--       Delta, Wave, Fluxus, Xeno, Synapse, KRNL → todos usam download quando FS disponivel
+--   [3] NameLbl oculto quando imagem carrega; aparece so se imagem falhar
+--   [4] Filtros de ordenacao: DEFAULT | RECENT | VALUE | RARITY | NAME
+--   [5] parseItems extrai data-id, data-value, data-demand numericos para ordenacao precisa
 
 local Players          = game:GetService("Players")
 local TweenService     = game:GetService("TweenService")
@@ -27,10 +31,6 @@ do
     elseif http_request        then execName = "Unknown (HTTP)"
     end
 end
-
--- Xeno bloqueia URLs externas em ImageLabel → precisa baixar
--- Delta, Synapse, KRNL, Wave, Fluxus → URL direta funciona
-local IS_XENO = execName:lower():find("xeno") ~= nil
 
 -- ══════════════════════════════════════════════
 --  HTTP HELPER
@@ -89,6 +89,25 @@ local function slugToName(slug)
     return (slug:gsub("%-"," "):gsub("(%a)([%w]*)", function(a,b) return a:upper()..b end))
 end
 
+-- Converte string de valor para numero (ex: "1,250,000" → 1250000)
+local function parseValueNum(s)
+    if not s or s == "N/A" or s == "" then return 0 end
+    return tonumber(s:gsub("[,%s]","")) or 0
+end
+
+-- Score de demand para ordenacao: Very High=5 High=4 Normal=3 Low=2 Very Low=1
+local function demandToScore(d, numericDem)
+    if numericDem and numericDem > 0 then return numericDem end
+    local dl = (d or ""):lower()
+    if dl:find("very high") then return 5
+    elseif dl:find("high")  then return 4
+    elseif dl:find("normal") or dl:find("moderate") then return 3
+    elseif dl:find("very low") then return 1
+    elseif dl:find("low") then return 2
+    end
+    return 0
+end
+
 local function parseItems(html)
     local items, positions, cursor = {}, {}, 1
     if not html then return items end
@@ -101,9 +120,17 @@ local function parseItems(html)
         local endPos = positions[i+1] and (positions[i+1]-1) or #html
         local chunk  = html:sub(pos, endPos)
         local item   = {}
+
+        -- data-id → recencia (maior id = mais novo)
+        local rawId = chunk:match('data%-id="(%d+)"') or chunk:match("data%-id='(%d+)'")
+        item.id = tonumber(rawId) or 0
+
+        -- imagem
         local src = chunk:match('<img[^>]*%ssrc="([^"]+)"') or chunk:match("<img[^>]*%ssrc='([^']+)'")
         item.image = fixUrl(src or "")
-        local alt  = chunk:match('<img[^>]*%salt="([^"]+)"') or chunk:match("<img[^>]*%salt='([^']+)'")
+
+        -- nome via alt ou slug da URL
+        local alt = chunk:match('<img[^>]*%salt="([^"]+)"') or chunk:match("<img[^>]*%salt='([^']+)'")
         if alt and alt:match("%S") then
             item.name = decodeHtml(alt)
         elseif item.image ~= "" then
@@ -112,12 +139,31 @@ local function parseItems(html)
         else
             item.name = "Unknown"
         end
-        local val   = chunk:match("<strong>([^<]+)</strong>")
-        item.value  = val and decodeHtml(val) or "N/A"
-        local dem   = chunk:match('title="Demand">([^<]+)<')
+
+        -- valor display (formato item-list: <strong>...</strong>)
+        local val  = chunk:match("<strong>([^<]+)</strong>")
+        item.value = val and decodeHtml(val) or "N/A"
+
+        -- valor numerico: prefere data-value, senao parseia display
+        local rawVal = chunk:match('data%-value="(%d+)"') or chunk:match("data%-value='(%d+)'")
+        if rawVal then
+            item.valueNum = tonumber(rawVal) or 0
+        else
+            item.valueNum = parseValueNum(item.value)
+        end
+
+        -- demand display
+        local dem  = chunk:match('title="Demand">([^<]+)<')
         item.demand = dem and decodeHtml(dem) or "N/A"
-        local tr    = chunk:match('title="Trend">([^<]+)<')
-        item.trend  = tr and decodeHtml(tr) or "N/A"
+
+        -- demand numerico: prefere data-demand (1-5), senao converte texto
+        local rawDem = chunk:match('data%-demand="(%d+)"') or chunk:match("data%-demand='(%d+)'")
+        item.demandNum = tonumber(rawDem) or 0
+
+        -- trend
+        local tr   = chunk:match('title="Trend">([^<]+)<')
+        item.trend = tr and decodeHtml(tr) or "N/A"
+
         if item.image ~= "" or item.name ~= "Unknown" then
             table.insert(items, item)
         end
@@ -126,24 +172,45 @@ local function parseItems(html)
 end
 
 -- ══════════════════════════════════════════════
---  SISTEMA DE IMAGEM
---
---  Sem teste de URL. Sem ContentProvider. Sem heartbeat para imagem.
---
---  Estrategia:
---    Delta / a maioria: IMAGE_CACHE[url] = url   → ImageLabel.Image = url (URL direta)
---    Xeno              : baixa binario → writefile → getcustomasset
---
---  Pre-cache: usa listfiles() para checar pasta de uma vez (rapido)
+--  ORDENACAO
 -- ══════════════════════════════════════════════
-local ASSET_FOLDER = "ValueCheck/assets"
-local IMAGE_CACHE  = {}   -- url → string (url ou rbxasset://)
-local PENDING_DL   = {}   -- urls em download
-local DL_QUEUE     = {}
-local DL_ACTIVE    = 0
-local DL_MAX       = 4
-local DL_TOTAL     = 0
-local DL_DONE      = 0
+local currentSort = "default"
+
+local function sortItems(items)
+    if currentSort == "default" then return items end
+    local sorted = {}
+    for i, v in ipairs(items) do sorted[i] = v end
+    if currentSort == "name" then
+        table.sort(sorted, function(a,b) return a.name:lower() < b.name:lower() end)
+    elseif currentSort == "value" then
+        table.sort(sorted, function(a,b) return (a.valueNum or 0) > (b.valueNum or 0) end)
+    elseif currentSort == "rarity" then
+        table.sort(sorted, function(a,b)
+            return demandToScore(a.demand, a.demandNum) > demandToScore(b.demand, b.demandNum)
+        end)
+    elseif currentSort == "recent" then
+        table.sort(sorted, function(a,b) return (a.id or 0) > (b.id or 0) end)
+    end
+    return sorted
+end
+
+-- ══════════════════════════════════════════════
+--  SISTEMA DE IMAGEM (HAS_FS-based)
+--
+--  FIX [1]: DL_QUEUED rastreia URLs ja contadas → DL_TOTAL nao sobe ao trocar categoria
+--  FIX [2]: HAS_FS (nao IS_XENO) controla se usa download ou URL direta
+--           Delta, Xeno, Wave, etc. → todos com FS usam download (mais confiavel)
+--           Executores sem FS → URL direta como fallback
+-- ══════════════════════════════════════════════
+local ASSET_FOLDER  = "ValueCheck/assets"
+local IMAGE_CACHE   = {}   -- url → rbxasset:// ou url direta
+local PENDING_DL    = {}   -- downloads em progresso ativo
+local DL_QUEUED     = {}   -- urls ja contadas em DL_TOTAL (evita duplicar contador)
+local DL_QUEUE      = {}
+local DL_ACTIVE     = 0
+local DL_MAX        = 4
+local DL_TOTAL      = 0
+local DL_DONE       = 0
 
 local HAS_FS = (makefolder ~= nil and writefile ~= nil
              and isfile    ~= nil and getcustomasset ~= nil
@@ -180,13 +247,13 @@ local function fireImageCallbacks(url)
     if not src then return end
     local cbs = imageCallbacks[url]
     if not cbs then return end
-    for _, fn in ipairs(cbs) do pcall(fn, src) end
     imageCallbacks[url] = nil
+    for _, fn in ipairs(cbs) do pcall(fn, src) end
 end
 
--- Download binario → salva → getcustomasset
+-- Download binario → writefile → getcustomasset
 local function downloadImage(url, cb)
-    if PENDING_DL[url] then cb(nil); return end
+    if PENDING_DL[url] then if cb then cb(nil) end; return end
     PENDING_DL[url] = true
     DL_ACTIVE = DL_ACTIVE + 1
     task.spawn(function()
@@ -198,7 +265,7 @@ local function downloadImage(url, cb)
             local ok = pcall(writefile, path, body)
             if ok then
                 local ok2, asset = pcall(getcustomasset, path)
-                if ok2 and asset then
+                if ok2 and asset and asset ~= "" then
                     IMAGE_CACHE[url] = asset
                     result = asset
                 end
@@ -207,7 +274,7 @@ local function downloadImage(url, cb)
         DL_ACTIVE     = DL_ACTIVE - 1
         DL_DONE       = DL_DONE + 1
         PENDING_DL[url] = nil
-        cb(result)
+        if cb then cb(result) end
         if #DL_QUEUE > 0 then
             local nxt = table.remove(DL_QUEUE, 1)
             nxt()
@@ -215,60 +282,69 @@ local function downloadImage(url, cb)
     end)
 end
 
--- Resolve imagem para um ImageLabel
--- Nao bloqueia, nao usa Heartbeat, nao usa ContentProvider
-local function resolveImage(url, imgLabel)
-    if not url or url == "" then return end
+-- Enfileira download sem duplicar DL_TOTAL (FIX [1])
+local function queueDownload(url, onDone)
+    if DL_QUEUED[url] then return end  -- ja contada: nao incrementa DL_TOTAL novamente
+    DL_QUEUED[url] = true
+    DL_TOTAL = DL_TOTAL + 1
+    local function doIt()
+        downloadImage(url, function(asset)
+            if asset and onDone then onDone(asset) end
+        end)
+    end
+    if DL_ACTIVE < DL_MAX then
+        doIt()
+    else
+        table.insert(DL_QUEUE, doIt)
+    end
+end
 
-    -- Ja no cache? Aplica direto
-    if IMAGE_CACHE[url] then
-        imgLabel.Image = IMAGE_CACHE[url]
+-- Resolve imagem: download (HAS_FS) ou URL direta (FIX [2])
+-- onLoaded → callback quando imagem ficou pronta
+-- onFailed → callback quando nao ha imagem valida
+local function resolveImage(url, imgLabel, onLoaded, onFailed)
+    if not url or url == "" then
+        if onFailed then onFailed() end
         return
     end
 
-    -- Registra callback para atualizar imgLabel quando a imagem ficar pronta
+    -- Ja no cache → aplica direto
+    if IMAGE_CACHE[url] then
+        imgLabel.Image = IMAGE_CACHE[url]
+        if onLoaded then onLoaded() end
+        return
+    end
+
+    -- Registra callback para quando o download terminar
     onImageReady(url, function(src)
         if imgLabel and imgLabel.Parent then
             imgLabel.Image = src
+            if onLoaded then onLoaded() end
         end
     end)
 
-    if PENDING_DL[url] then return end  -- ja baixando
+    -- Ja em progresso? apenas aguarda callback
+    if PENDING_DL[url] or DL_QUEUED[url] then return end
 
-    if not IS_XENO then
-        -- ─── Delta, Synapse, KRNL, Fluxus, Wave, etc. ───
-        -- URL direta funciona no ImageLabel; sem download necessario
+    if HAS_FS then
+        -- Download local (funciona em Delta, Xeno, Wave, Fluxus, Synapse, KRNL...)
+        queueDownload(url, function()
+            fireImageCallbacks(url)
+        end)
+    else
+        -- Sem FS: URL direta (executes sem filesystem)
         IMAGE_CACHE[url] = url
         imgLabel.Image   = url
         fireImageCallbacks(url)
-    else
-        -- ─── Xeno: bloqueia URL externa → baixa localmente ───
-        if not HAS_FS then return end  -- sem filesystem, sem alternativa
-
-        local function doDownload()
-            downloadImage(url, function(asset)
-                if asset then
-                    fireImageCallbacks(url)
-                end
-            end)
-        end
-
-        DL_TOTAL = DL_TOTAL + 1
-        if DL_ACTIVE < DL_MAX then
-            doDownload()
-        else
-            table.insert(DL_QUEUE, doDownload)
-        end
+        -- onLoaded sera chamado pelo fireImageCallbacks via callback registrado acima
     end
 end
 
 -- ══════════════════════════════════════════════
---  PRE-CACHE LOCAL (usa listfiles → O(1) vs O(n) de isfile)
+--  PRE-CACHE LOCAL (listfiles para checar tudo de uma vez)
 -- ══════════════════════════════════════════════
 local function preCacheLocalAssets(allItems)
     if not HAS_FS then return end
-
-    -- Pega lista de arquivos locais de uma vez
     local cachedSet = {}
     if HAS_LISTFILES then
         local ok, files = pcall(listfiles, ASSET_FOLDER)
@@ -279,26 +355,26 @@ local function preCacheLocalAssets(allItems)
             end
         end
     end
-
     for _, item in ipairs(allItems) do
         local url = item.image
         if url and url ~= "" and not IMAGE_CACHE[url] then
             local fname = urlToFilename(url)
-            local fpath = cachedSet[fname]
-            if fpath then
-                -- Arquivo existe localmente: carrega sem HTTP
-                local ok2, asset = pcall(getcustomasset, ASSET_FOLDER .. "/" .. fname)
-                if ok2 and asset then
-                    IMAGE_CACHE[url] = asset
+            if HAS_LISTFILES then
+                if cachedSet[fname] then
+                    local ok2, asset = pcall(getcustomasset, ASSET_FOLDER .. "/" .. fname)
+                    if ok2 and asset and asset ~= "" then
+                        IMAGE_CACHE[url] = asset
+                        DL_QUEUED[url]   = true  -- ja tem localmente, nao precisa baixar
+                    end
                 end
-            elseif not HAS_LISTFILES then
-                -- Fallback: isfile por item (executores sem listfiles)
+            else
                 local path = ASSET_FOLDER .. "/" .. fname
                 local okF, exists = pcall(isfile, path)
                 if okF and exists then
                     local ok2, asset = pcall(getcustomasset, path)
-                    if ok2 and asset then
+                    if ok2 and asset and asset ~= "" then
                         IMAGE_CACHE[url] = asset
+                        DL_QUEUED[url]   = true
                     end
                 end
             end
@@ -311,6 +387,21 @@ end
 -- ══════════════════════════════════════════════
 local allData    = {}
 local currentCat = { label = "ALL", type = "all" }
+
+local function getAllItems()
+    local merged = {}
+    for _, catItems in pairs(allData) do
+        for _, item in ipairs(catItems) do table.insert(merged, item) end
+    end
+    return merged
+end
+
+local function getCurrentItems()
+    if currentCat.type == "all" then
+        return getAllItems()
+    end
+    return allData[currentCat.label] or {}
+end
 
 -- ══════════════════════════════════════════════
 --  CORES
@@ -331,6 +422,7 @@ local C = {
     white     = Color3.fromRGB(255, 255, 255),
     titleBar  = Color3.fromRGB(14,  14,  22),
     imgBg     = Color3.fromRGB(18,  18,  30),
+    sortBg    = Color3.fromRGB(22,  22,  36),
 }
 
 local function demandColor(d)
@@ -345,7 +437,7 @@ end
 
 local function trendInfo(t)
     local tl = (t or ""):lower()
-    if     tl:find("ris") or tl:find("up")                    then return "^ ", C.green
+    if     tl:find("ris") or tl:find("up")                       then return "^ ", C.green
     elseif tl:find("drop") or tl:find("down") or tl:find("fall") then return "v ", C.red
     else return "- ", C.textMuted end
 end
@@ -413,16 +505,16 @@ local SubLbl = Instance.new("TextLabel", TBar)
 SubLbl.Size                   = UDim2.new(0, 500, 0, 13)
 SubLbl.Position               = UDim2.new(0, 16, 1, -18)
 SubLbl.BackgroundTransparency = 1
-SubLbl.Text                   = "stktradings.com  -  " .. execName
+SubLbl.Text                   = "stktradings.com  -  " .. execName .. (HAS_FS and " [FS]" or " [URL]")
 SubLbl.TextColor3             = C.textMuted
 SubLbl.TextSize               = 9
 SubLbl.Font                   = Enum.Font.Gotham
 SubLbl.TextXAlignment         = Enum.TextXAlignment.Left
 SubLbl.ZIndex                 = 6
 
--- Indicador de download (so aparece no Xeno)
+-- Indicador de download (mostra quando HAS_FS e tem downloads pendentes)
 local DlStatusLbl = Instance.new("TextLabel", TBar)
-DlStatusLbl.Size                   = UDim2.new(0, 320, 0, 13)
+DlStatusLbl.Size                   = UDim2.new(0, 380, 0, 13)
 DlStatusLbl.Position               = UDim2.new(0, 16, 1, -18)
 DlStatusLbl.BackgroundTransparency = 1
 DlStatusLbl.Text                   = ""
@@ -435,27 +527,32 @@ DlStatusLbl.Visible                = false
 
 local blinkConn = nil
 local function startDownloadIndicator()
-    if not IS_XENO then return end
+    if not HAS_FS then return end
+    if blinkConn then return end  -- ja rodando
     DlStatusLbl.Visible = true
-    SubLbl.Visible = false
-    if blinkConn then blinkConn:Disconnect(); blinkConn = nil end
+    SubLbl.Visible      = false
     local blink = false
     blinkConn = RunService.Heartbeat:Connect(function()
         local pending = DL_TOTAL - DL_DONE
-        if pending <= 0 then
-            DlStatusLbl.Visible = false
-            SubLbl.Visible = true
+        if pending <= 0 and DL_TOTAL > 0 then
+            DlStatusLbl.Text    = "Assets OK: " .. DL_DONE .. " em cache"
+            task.delay(1.5, function()
+                DlStatusLbl.Visible = false
+                SubLbl.Visible      = true
+            end)
             blinkConn:Disconnect(); blinkConn = nil
             return
         end
-        blink = not blink
-        DlStatusLbl.Text = blink
-            and ("Baixando assets: " .. DL_DONE .. " / " .. DL_TOTAL .. " ...")
-            or  ("Baixando assets: " .. DL_DONE .. " / " .. DL_TOTAL)
+        if pending > 0 then
+            blink = not blink
+            DlStatusLbl.Text = blink
+                and ("Baixando assets: " .. DL_DONE .. " / " .. DL_TOTAL .. " ...")
+                or  ("Baixando assets: " .. DL_DONE .. " / " .. DL_TOTAL)
+        end
     end)
 end
 
--- Botoes
+-- Botoes da barra de titulo
 local function winBtn(col, lbl, xOff)
     local b = Instance.new("TextButton", TBar)
     b.Size             = UDim2.new(0, 26, 0, 26)
@@ -476,7 +573,7 @@ end
 
 local CloseBtn   = winBtn(Color3.fromRGB(255, 90, 85),  "X", -44)
 local MinBtn     = winBtn(Color3.fromRGB(255,185, 40),  "-", -78)
-local RefreshBtn = winBtn(Color3.fromRGB(60, 60, 90),   "R", -112)
+local RefreshBtn = winBtn(Color3.fromRGB(60,  60, 90),  "R", -112)
 
 -- Drag
 do
@@ -549,7 +646,7 @@ SbDiv.BorderSizePixel  = 0
 SbDiv.LayoutOrder      = -1
 
 -- ══════════════════════════════════════════════
---  PAINEL
+--  PAINEL PRINCIPAL
 -- ══════════════════════════════════════════════
 local PANEL_X = SB_W + 6
 
@@ -560,7 +657,7 @@ Panel.Position               = UDim2.new(0, PANEL_X, 0, 3)
 Panel.BackgroundTransparency = 1
 Panel.ClipsDescendants       = false
 
--- Barra de busca
+-- ─── Barra de busca ─────────────────────────
 local SearchWrap = Instance.new("Frame", Panel)
 SearchWrap.Size             = UDim2.new(1, 0, 0, 36)
 SearchWrap.BackgroundColor3 = C.card
@@ -589,14 +686,14 @@ SearchBox.Font                   = Enum.Font.Gotham
 SearchBox.TextXAlignment         = Enum.TextXAlignment.Left
 SearchBox.ClearTextOnFocus       = false
 
--- Info bar
+-- ─── Info bar (categoria + contagem) ────────
 local InfoBar = Instance.new("Frame", Panel)
-InfoBar.Size                   = UDim2.new(1, 0, 0, 24)
+InfoBar.Size                   = UDim2.new(1, 0, 0, 22)
 InfoBar.Position               = UDim2.new(0, 0, 0, 42)
 InfoBar.BackgroundTransparency = 1
 
 local CatNameLbl = Instance.new("TextLabel", InfoBar)
-CatNameLbl.Size                   = UDim2.new(0.6, 0, 1, 0)
+CatNameLbl.Size                   = UDim2.new(0.55, 0, 1, 0)
 CatNameLbl.BackgroundTransparency = 1
 CatNameLbl.TextColor3             = C.accent
 CatNameLbl.TextSize               = 11
@@ -604,27 +701,119 @@ CatNameLbl.Font                   = Enum.Font.GothamBold
 CatNameLbl.TextXAlignment         = Enum.TextXAlignment.Left
 
 local CountLbl = Instance.new("TextLabel", InfoBar)
-CountLbl.Size                   = UDim2.new(0.4, 0, 1, 0)
-CountLbl.Position               = UDim2.new(0.6, 0, 0, 0)
+CountLbl.Size                   = UDim2.new(0.45, 0, 1, 0)
+CountLbl.Position               = UDim2.new(0.55, 0, 0, 0)
 CountLbl.BackgroundTransparency = 1
 CountLbl.TextColor3             = C.textMuted
 CountLbl.TextSize               = 10
 CountLbl.Font                   = Enum.Font.Gotham
 CountLbl.TextXAlignment         = Enum.TextXAlignment.Right
 
+-- ─── Sort Bar ───────────────────────────────
+--  Botoes: DEFAULT | RECENT | VALUE | RARITY | NAME
+local SORT_Y = 68
+local SORT_H = 24
+
+local SortBar = Instance.new("Frame", Panel)
+SortBar.Name                   = "SortBar"
+SortBar.Size                   = UDim2.new(1, 0, 0, SORT_H)
+SortBar.Position               = UDim2.new(0, 0, 0, SORT_Y)
+SortBar.BackgroundTransparency = 1
+
+local SortLayout = Instance.new("UIListLayout", SortBar)
+SortLayout.FillDirection       = Enum.FillDirection.Horizontal
+SortLayout.Padding             = UDim.new(0, 5)
+SortLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+SortLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+
+local SORT_DEFS = {
+    { key = "default", label = "DEFAULT", tip = "Ordem original" },
+    { key = "recent",  label = "RECENT",  tip = "Mais novos primeiro" },
+    { key = "value",   label = "VALUE",   tip = "Maior valor primeiro" },
+    { key = "rarity",  label = "RARITY",  tip = "Maior demanda primeiro" },
+    { key = "name",    label = "NAME",    tip = "A-Z" },
+}
+
+-- forward declaration para callbacks dos botoes
+local renderItems
+
+local sortBtns = {}
+
+local function updateSortBtns()
+    for _, sb in ipairs(sortBtns) do
+        local active = sb.key == currentSort
+        TweenService:Create(sb.btn, TweenInfo.new(0.12), {
+            BackgroundColor3 = active and C.accent or C.sortBg,
+        }):Play()
+        sb.lbl.TextColor3 = active and C.white or C.textMuted
+    end
+end
+
+for _, sd in ipairs(SORT_DEFS) do
+    local Wrap = Instance.new("Frame", SortBar)
+    Wrap.Size             = UDim2.new(0, 72, 0, SORT_H)
+    Wrap.BackgroundColor3 = C.sortBg
+    Wrap.BorderSizePixel  = 0
+    Instance.new("UICorner", Wrap).CornerRadius = UDim.new(0, 6)
+
+    local Btn = Instance.new("TextButton", Wrap)
+    Btn.Size             = UDim2.new(1, 0, 1, 0)
+    Btn.BackgroundTransparency = 1
+    Btn.Text             = ""
+    Btn.BorderSizePixel  = 0
+    Btn.AutoButtonColor  = false
+
+    local Lbl = Instance.new("TextLabel", Wrap)
+    Lbl.Size                   = UDim2.new(1, 0, 1, 0)
+    Lbl.BackgroundTransparency = 1
+    Lbl.Text                   = sd.label
+    Lbl.TextColor3             = C.textMuted
+    Lbl.TextSize               = 9
+    Lbl.Font                   = Enum.Font.GothamBold
+    Lbl.TextXAlignment         = Enum.TextXAlignment.Center
+
+    table.insert(sortBtns, { key = sd.key, btn = Btn, wrap = Wrap, lbl = Lbl })
+
+    local sk = sd.key
+    Btn.MouseButton1Click:Connect(function()
+        if currentSort == sk then return end
+        currentSort = sk
+        updateSortBtns()
+        if renderItems then
+            renderItems(getCurrentItems(), SearchBox.Text)
+        end
+    end)
+    Btn.MouseEnter:Connect(function()
+        if currentSort ~= sk then
+            TweenService:Create(Wrap,TweenInfo.new(0.1),{BackgroundColor3=C.card}):Play()
+        end
+    end)
+    Btn.MouseLeave:Connect(function()
+        if currentSort ~= sk then
+            TweenService:Create(Wrap,TweenInfo.new(0.1),{BackgroundColor3=C.sortBg}):Play()
+        end
+    end)
+end
+
+updateSortBtns()
+
+-- ─── Divider ────────────────────────────────
+local DIV_Y    = SORT_Y + SORT_H + 4
+local SCROLL_Y = DIV_Y + 5
+
 local Divider = Instance.new("Frame", Panel)
 Divider.Size             = UDim2.new(1, 0, 0, 1)
-Divider.Position         = UDim2.new(0, 0, 0, 68)
+Divider.Position         = UDim2.new(0, 0, 0, DIV_Y)
 Divider.BackgroundColor3 = C.border
 Divider.BorderSizePixel  = 0
 
 -- ══════════════════════════════════════════════
---  SCROLL DE ITENS  (4 colunas x 147px = 612px < 778px OK)
+--  SCROLL DE ITENS
 -- ══════════════════════════════════════════════
 local ItemScroll = Instance.new("ScrollingFrame", Panel)
 ItemScroll.Name                   = "ItemScroll"
-ItemScroll.Size                   = UDim2.new(1, 0, 1, -76)
-ItemScroll.Position               = UDim2.new(0, 0, 0, 74)
+ItemScroll.Size                   = UDim2.new(1, 0, 1, -SCROLL_Y)
+ItemScroll.Position               = UDim2.new(0, 0, 0, SCROLL_Y)
 ItemScroll.BackgroundTransparency = 1
 ItemScroll.ScrollBarThickness     = 5
 ItemScroll.ScrollBarImageColor3   = C.accent
@@ -710,7 +899,7 @@ ProgLabel.Font                   = Enum.Font.Gotham
 ProgLabel.ZIndex                 = 32
 
 -- ══════════════════════════════════════════════
---  POOL DE CARDS (ZIndex corretos, hover conectado uma vez)
+--  POOL DE CARDS
 -- ══════════════════════════════════════════════
 local cardPool = {}
 
@@ -733,23 +922,26 @@ local function buildCard()
     Instance.new("UICorner", ImgBg).CornerRadius = UDim.new(0, 8)
 
     local Img = Instance.new("ImageLabel", ImgBg)
-    Img.Name                    = "Img"
-    Img.Size                    = UDim2.new(1, 0, 1, 0)
-    Img.BackgroundTransparency  = 1
-    Img.Image                   = ""
-    Img.ScaleType               = Enum.ScaleType.Fit
-    Img.BorderSizePixel         = 0
-    Img.ZIndex                  = 3
+    Img.Name                   = "Img"
+    Img.Size                   = UDim2.new(1, 0, 1, 0)
+    Img.BackgroundTransparency = 1
+    Img.Image                  = ""
+    Img.ScaleType              = Enum.ScaleType.Fit
+    Img.BorderSizePixel        = 0
+    Img.ZIndex                 = 3
 
+    -- Letra inicial: exibida quando imagem nao carregou
     local FallLbl = Instance.new("TextLabel", ImgBg)
-    FallLbl.Name                    = "FallLbl"
-    FallLbl.Size                    = UDim2.new(1, 0, 1, 0)
-    FallLbl.BackgroundTransparency  = 1
-    FallLbl.TextColor3              = C.textMuted
-    FallLbl.TextSize                = 34
-    FallLbl.Font                    = Enum.Font.GothamBold
-    FallLbl.ZIndex                  = 4
+    FallLbl.Name                   = "FallLbl"
+    FallLbl.Size                   = UDim2.new(1, 0, 1, 0)
+    FallLbl.BackgroundTransparency = 1
+    FallLbl.TextColor3             = C.textMuted
+    FallLbl.TextSize               = 34
+    FallLbl.Font                   = Enum.Font.GothamBold
+    FallLbl.ZIndex                 = 4
 
+    -- FIX [3]: NameLbl so aparece quando imagem NAO carregou
+    --          Quando imagem existe (ja na propria imagem do item) → oculto
     local NameLbl = Instance.new("TextLabel", Card)
     NameLbl.Name               = "NameLbl"
     NameLbl.Size               = UDim2.new(1, -8, 0, 30)
@@ -772,14 +964,14 @@ local function buildCard()
     Instance.new("UICorner", ValBg).CornerRadius = UDim.new(0, 7)
 
     local ValLbl = Instance.new("TextLabel", ValBg)
-    ValLbl.Name                    = "ValLbl"
-    ValLbl.Size                    = UDim2.new(1, 0, 1, 0)
-    ValLbl.BackgroundTransparency  = 1
-    ValLbl.TextColor3              = C.accent
-    ValLbl.TextSize                = 13
-    ValLbl.Font                    = Enum.Font.GothamBold
-    ValLbl.TextXAlignment          = Enum.TextXAlignment.Center
-    ValLbl.ZIndex                  = 6
+    ValLbl.Name                   = "ValLbl"
+    ValLbl.Size                   = UDim2.new(1, 0, 1, 0)
+    ValLbl.BackgroundTransparency = 1
+    ValLbl.TextColor3             = C.accent
+    ValLbl.TextSize               = 13
+    ValLbl.Font                   = Enum.Font.GothamBold
+    ValLbl.TextXAlignment         = Enum.TextXAlignment.Center
+    ValLbl.ZIndex                 = 6
 
     local DmTrBar = Instance.new("Frame", Card)
     DmTrBar.Name               = "DmTrBar"
@@ -820,18 +1012,23 @@ local function buildCard()
 end
 
 -- ══════════════════════════════════════════════
---  RENDER (pool reusavel)
+--  RENDER (pool reusavel + FIX [1] + FIX [3])
 -- ══════════════════════════════════════════════
-local function renderItems(items, filter)
+renderItems = function(items, filter)
     filter = (filter or ""):lower():match("^%s*(.-)%s*$") or ""
 
+    -- Aplica ordenacao atual (FIX [4])
+    local sorted = sortItems(items)
+
+    -- Oculta todos os cards do pool
     for _, c in ipairs(cardPool) do
         c.Parent  = nil
         c.Visible = false
     end
 
+    -- Conta quantos passam no filtro
     local needed = 0
-    for _, item in ipairs(items) do
+    for _, item in ipairs(sorted) do
         if filter == "" or item.name:lower():find(filter, 1, true) then
             needed = needed + 1
         end
@@ -843,7 +1040,7 @@ local function renderItems(items, filter)
 
     local count, poolIdx = 0, 0
 
-    for _, item in ipairs(items) do
+    for _, item in ipairs(sorted) do
         if filter ~= "" and not item.name:lower():find(filter, 1, true) then continue end
 
         count   = count + 1
@@ -870,31 +1067,36 @@ local function renderItems(items, filter)
         Card.Stroke.Thickness = 1
         Card.LayoutOrder      = poolIdx
 
-        local cached = IMAGE_CACHE[item.image]
-        if cached and cached ~= "" then
-            Img.Image      = cached
-            FallLbl.Visible = false
-            Card.ImgBg.BackgroundTransparency = 1
-        else
+        -- FIX [3]: helpers para mostrar/ocultar NameLbl
+        local function onImgLoaded()
+            if Img and Img.Parent then
+                FallLbl.Visible = false
+                NameLbl.Visible = false  -- imagem tem nome proprio
+                Card.ImgBg.BackgroundTransparency = 1
+            end
+        end
+
+        local function showFallback()
             Img.Image      = ""
             FallLbl.Text   = item.name:sub(1,1):upper()
             FallLbl.Visible = true
-            Card.ImgBg.BackgroundColor3        = C.imgBg
-            Card.ImgBg.BackgroundTransparency  = 0
+            NameLbl.Visible = true  -- sem imagem → mostra nome
+            Card.ImgBg.BackgroundColor3       = C.imgBg
+            Card.ImgBg.BackgroundTransparency = 0
+        end
 
+        -- Ja no cache?
+        local cached = IMAGE_CACHE[item.image]
+        if cached and cached ~= "" then
+            Img.Image = cached
+            FallLbl.Visible = false
+            NameLbl.Visible = false
+            Card.ImgBg.BackgroundTransparency = 1
+        else
+            showFallback()
             if item.image and item.image ~= "" then
-                local captImg  = Img
-                local captFall = FallLbl
-                local captBg   = Card.ImgBg
-                local captUrl  = item.image
-                onImageReady(captUrl, function(src)
-                    if captImg and captImg.Parent then
-                        captImg.Image    = src
-                        captFall.Visible = false
-                        captBg.BackgroundTransparency = 1
-                    end
-                end)
-                resolveImage(item.image, Img)
+                -- FIX [1]: resolveImage usa DL_QUEUED → nao duplica DL_TOTAL ao trocar aba
+                resolveImage(item.image, Img, onImgLoaded, nil)
             end
         end
 
@@ -904,21 +1106,13 @@ local function renderItems(items, filter)
 
     CatNameLbl.Text = currentCat.label
     CountLbl.Text   = count .. " item" .. (count ~= 1 and "s" or "")
-                    .. (filter ~= "" and ("  -  \"" .. filter .. "\"") or "")
+                    .. (filter ~= "" and ("  \"" .. filter .. "\"") or "")
 end
 
 -- ══════════════════════════════════════════════
---  ABAS
+--  ABAS DE CATEGORIA
 -- ══════════════════════════════════════════════
 local tabList = {}
-
-local function getAllMergedItems()
-    local merged = {}
-    for _, catItems in pairs(allData) do
-        for _, item in ipairs(catItems) do table.insert(merged, item) end
-    end
-    return merged
-end
 
 local function setActiveTab(cat)
     currentCat = cat
@@ -930,8 +1124,7 @@ local function setActiveTab(cat)
         t.btn.TextColor3 = active and C.white or C.textMuted
     end
     ItemScroll.CanvasPosition = Vector2.new(0, 0)
-    local items = cat.type == "all" and getAllMergedItems() or (allData[cat.label] or {})
-    renderItems(items, SearchBox.Text)
+    renderItems(getCurrentItems(), SearchBox.Text)
 end
 
 local function makeTabBtn(label, order)
@@ -976,14 +1169,13 @@ for i, cat in ipairs(CATEGORIES) do
 end
 
 -- ══════════════════════════════════════════════
---  BUSCA (debounce)
+--  BUSCA (debounce 180ms)
 -- ══════════════════════════════════════════════
 local searchTask = nil
 SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
     if searchTask then task.cancel(searchTask) end
     searchTask = task.delay(0.18, function()
-        local items = currentCat.type == "all" and getAllMergedItems() or (allData[currentCat.label] or {})
-        renderItems(items, SearchBox.Text)
+        renderItems(getCurrentItems(), SearchBox.Text)
     end)
 end)
 
@@ -1001,7 +1193,7 @@ end)
 CloseBtn.MouseButton1Click:Connect(function()
     TweenService:Create(Win, TweenInfo.new(0.2), {
         BackgroundTransparency = 1,
-        Size = UDim2.new(0, WIN_W, 0, 0),
+        Size     = UDim2.new(0, WIN_W, 0, 0),
         Position = UDim2.new(0.5, -WIN_W/2, 0.5, 0),
     }):Play()
     task.delay(0.22, function() ScreenGui:Destroy() end)
@@ -1012,11 +1204,20 @@ end)
 -- ══════════════════════════════════════════════
 local function fetchAll()
     ensureFolders()
-    allData = {}
-    IMAGE_CACHE = {}
+
+    -- Reset completo de estado
+    allData        = {}
+    IMAGE_CACHE    = {}
     imageCallbacks = {}
-    DL_TOTAL = 0; DL_DONE = 0; DL_ACTIVE = 0
-    DL_QUEUE = {}; PENDING_DL = {}
+    DL_QUEUED      = {}
+    DL_TOTAL       = 0
+    DL_DONE        = 0
+    DL_ACTIVE      = 0
+    DL_QUEUE       = {}
+    PENDING_DL     = {}
+    if blinkConn then blinkConn:Disconnect(); blinkConn = nil end
+    DlStatusLbl.Visible = false
+    SubLbl.Visible      = true
 
     LoadBG.Visible                = true
     LoadBG.BackgroundTransparency = 0.05
@@ -1038,10 +1239,10 @@ local function fetchAll()
         task.wait(0.22)
     end
 
-    -- Pre-cache assets locais (usa listfiles → muito rapido)
+    -- Pre-cache assets que ja existem localmente
     LoadStatusLbl.Text = "Verificando assets locais..."
-    local allItems = getAllMergedItems()
-    preCacheLocalAssets(allItems)
+    local allItemsList = getAllItems()
+    preCacheLocalAssets(allItemsList)
 
     LoadStatusLbl.Text = "Dados carregados!"
     ProgLabel.Text     = total .. " / " .. total .. " categorias"
@@ -1051,29 +1252,32 @@ local function fetchAll()
     task.wait(0.3)
     LoadBG.Visible = false
 
-    -- Exibe aba ativa
+    -- Exibe aba atual
     setActiveTab(currentCat)
 
-    -- Para Xeno: inicia downloads em background para itens sem cache local
-    if IS_XENO and HAS_FS then
+    -- Background: baixa assets sem cache (HAS_FS)
+    -- FIX [1]: conta cada URL uma unica vez via DL_QUEUED
+    if HAS_FS then
         task.spawn(function()
-            -- Conta quantos precisam de download
-            for _, item in ipairs(allItems) do
-                if item.image and item.image ~= "" and not IMAGE_CACHE[item.image] then
-                    DL_TOTAL = DL_TOTAL + 1
+            -- Conta pendentes ainda nao enfileirados por resolveImage
+            local pendingUrls = {}
+            for _, item in ipairs(allItemsList) do
+                local url = item.image
+                if url and url ~= "" and not IMAGE_CACHE[url] and not DL_QUEUED[url] then
+                    DL_QUEUED[url] = true   -- marca como contada
+                    DL_TOTAL       = DL_TOTAL + 1
+                    table.insert(pendingUrls, url)
                 end
             end
 
-            if DL_TOTAL > 0 then
+            if #pendingUrls > 0 or DL_TOTAL > DL_DONE then
                 startDownloadIndicator()
-                for _, item in ipairs(allItems) do
-                    local url = item.image
-                    if url and url ~= "" and not IMAGE_CACHE[url] and not PENDING_DL[url] then
+                for _, url in ipairs(pendingUrls) do
+                    if not PENDING_DL[url] then
+                        local captUrl = url
                         local function doIt()
-                            downloadImage(url, function(asset)
-                                if asset then
-                                    fireImageCallbacks(url)
-                                end
+                            downloadImage(captUrl, function(asset)
+                                if asset then fireImageCallbacks(captUrl) end
                             end)
                         end
                         if DL_ACTIVE < DL_MAX then
@@ -1081,7 +1285,7 @@ local function fetchAll()
                         else
                             table.insert(DL_QUEUE, doIt)
                         end
-                        -- Pequena pausa a cada 4 downloads para nao travar UI
+                        -- Respira para nao travar UI a cada batch completo
                         if DL_ACTIVE >= DL_MAX then task.wait(0.02) end
                     end
                 end
@@ -1091,7 +1295,6 @@ local function fetchAll()
 end
 
 RefreshBtn.MouseButton1Click:Connect(function()
-    if blinkConn then blinkConn:Disconnect(); blinkConn = nil end
     task.spawn(fetchAll)
 end)
 
@@ -1100,4 +1303,8 @@ end)
 -- ══════════════════════════════════════════════
 task.spawn(fetchAll)
 
-print("[STK] Value Checker v3.1 carregado - Executor: " .. execName .. (IS_XENO and " [modo download]" or " [modo URL direta]"))
+print(string.format(
+    "[STK] Value Checker v3.2 | Executor: %s | Imagens: %s",
+    execName,
+    HAS_FS and "download local" or "URL direta"
+))
